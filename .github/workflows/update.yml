@@ -2,8 +2,8 @@ name: Auto Update Proxies
 
 on:
   schedule:
-    # Läuft automatisch alle 3 Stunden
-    - cron: '0 */3 * * *'
+    # Läuft automatisch alle 30 Minuten
+    - cron: '*/30 * * * *'
   workflow_dispatch: # Erlaubt manuelles Starten per Klick
 
 jobs:
