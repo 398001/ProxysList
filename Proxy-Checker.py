@@ -1,11 +1,13 @@
+import argparse
 import asyncio
 import os
 import re
 import sys
 import time
 import aiohttp
+from aiohttp_socks import ProxyConnector
 
-# Windows Selector nutzen, um Proactor-Crashs zu vermeiden
+# Windows Selector nutzen, um Socket-Fehler zu vermeiden
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -33,12 +35,14 @@ PROXY_SOURCES = {
 }
 
 PROXY_REGEX = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}\b")
+TEST_URL = "http://httpbin.org/ip"
 
-# OPTIMIERTE EINSTELLUNGEN FOR SPEED & WINDOWS STABILITÄT
-TIMEOUT = 0.6          # 600ms Timeout
-BATCH_SIZE = 450       # Sicheres Windows-Limit (< 512 Sockets)
+# PERFORMANCE-EINSTELLUNGEN
+TCP_TIMEOUT = 0.6       # Timeout für die schnelle TCP-Vorprüfung
+HANDSHAKE_TIMEOUT = 2.5 # Timeout für den echten Protokoll-Test
+BATCH_SIZE = 400        # Sicheres Socket-Limit
 
-async def fetch_urls(session, url):
+async def fetch_urls(session: aiohttp.ClientSession, url: str) -> set:
     try:
         async with session.get(url, timeout=5) as resp:
             if resp.status == 200:
@@ -48,44 +52,69 @@ async def fetch_urls(session, url):
         pass
     return set()
 
-async def ping_proxy(proxy_str, protocol):
+# PHASE 1: Schneller TCP-Ping
+async def ping_proxy(proxy_str: str) -> str | None:
     ip, port = proxy_str.split(":")
     try:
         _, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, int(port)), timeout=TIMEOUT
+            asyncio.open_connection(ip, int(port)), timeout=TCP_TIMEOUT
         )
         writer.close()
         await writer.wait_closed()
-        return f"{protocol}://{proxy_str}"
+        return proxy_str
     except Exception:
         return None
 
-async def fast_scan_protocol(protocol, proxies):
-    print(f"\nScanne {len(proxies)} {protocol.upper()} Proxys...")
+# PHASE 2: Echter Protokoll-Handshake
+async def validate_proxy(semaphore: asyncio.Semaphore, protocol: str, proxy_str: str) -> str | None:
+    proxy_url = f"{protocol}://{proxy_str}"
+    async with semaphore:
+        try:
+            connector = ProxyConnector.from_url(proxy_url)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(TEST_URL, timeout=aiohttp.ClientTimeout(total=HANDSHAKE_TIMEOUT)) as resp:
+                    if resp.status == 200:
+                        return proxy_url
+        except Exception:
+            pass
+        return None
+
+async def scan_protocol(protocol: str, proxies: set) -> list[str]:
+    print(f"\n--- Scanne {len(proxies)} {protocol.upper()} Proxys ---")
     proxy_list = list(proxies)
     total = len(proxy_list)
-    alive = []
+    tcp_alive = []
 
+    # Phase 1
+    print(f"[Phase 1] TCP-Ping ({TCP_TIMEOUT}s Timeout)...")
     for i in range(0, total, BATCH_SIZE):
         batch = proxy_list[i : i + BATCH_SIZE]
-        tasks = [ping_proxy(p, protocol) for p in batch]
-        
+        tasks = [ping_proxy(p) for p in batch]
         results = await asyncio.gather(*tasks)
-        alive.extend([res for res in results if res is not None])
+        tcp_alive.extend([res for res in results if res is not None])
         
         current = min(i + BATCH_SIZE, total)
         percent = int((current / total) * 100)
-        print(f"\r progress: {current}/{total} ({percent}%) | Gefunden: {len(alive)}", end="", flush=True)
+        print(f"\r progress: {current}/{total} ({percent}%) | Offene Ports: {len(tcp_alive)}", end="", flush=True)
 
-    print(f"\n -> Fertig! {len(alive)} live Proxys gefunden.")
-    return alive
+    print(f"\n -> {len(tcp_alive)} offene Ports gefunden.")
+    if not tcp_alive:
+        return []
 
-def save_results(working_proxies):
-    print("\n3. Speichere Ergebnisse in Dateien...")
-    all_working = []
+    # Phase 2
+    print(f"[Phase 2] Validiere echten {protocol.upper()}-Handshake für {len(tcp_alive)} Proxys...")
+    semaphore = asyncio.Semaphore(100)
+    val_tasks = [validate_proxy(semaphore, protocol, p) for p in tcp_alive]
+    val_results = await asyncio.gather(*val_tasks)
     
-    # Pfad des Skripts ermitteln (F:\Projects\DDoS\)
+    verified = [p for p in val_results if p is not None]
+    print(f" -> Bestätigt: {len(verified)} echte {protocol.upper()}-Proxys einsatzbereit.")
+    return verified
+
+def save_results(working_proxies: dict):
+    print("\nSpeichere Ergebnisse in Dateien...")
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    all_working = []
     
     for proto, proxies in working_proxies.items():
         filename = os.path.join(script_dir, f"{proto}_working.txt")
@@ -101,7 +130,7 @@ def save_results(working_proxies):
             f.write(f"{p}\n")
     print(f" -> {all_file} ({len(all_working)} Einträge Gesamt)")
 
-async def main():
+async def run_checker():
     start_time = time.time()
     print("1. Lade Proxy-Listen herunter...")
     cleaned = {"http": set(), "socks4": set(), "socks5": set()}
@@ -116,17 +145,30 @@ async def main():
     total_proxies = sum(len(p) for p in cleaned.values())
     print(f"Gesamt: {total_proxies} eindeutige Proxys geladen.")
 
-    print("\n2. Starte Massen-Scan...")
+    print("\n2. Starte Prüfung (TCP-Precheck + Protokoll-Handshake)...")
     working_proxies = {}
     for proto, proxies in cleaned.items():
-        working_proxies[proto] = await fast_scan_protocol(proto, proxies)
+        working_proxies[proto] = await scan_protocol(proto, proxies)
 
     save_results(working_proxies)
 
     elapsed = round(time.time() - start_time, 2)
     print(f"\n================ SKRIPT ABGESCHLOSSEN ================")
-    print(f"Dauer: {elapsed} Sekunden für {total_proxies} Proxys.")
-    print(f"Ergebnis: {sum(len(v) for v in working_proxies.values())} funktionierende Verbindungen gesichert.")
+    print(f"Dauer: {elapsed}s | Bestätigte Proxys: {sum(len(v) for v in working_proxies.values())}")
+
+async def main():
+    parser = argparse.ArgumentParser(description="Xeno Proxy Checker")
+    parser.add_argument("--loop", type=int, help="Intervall in Minuten für automatischen Wiederholungs-Check")
+    args = parser.parse_args()
+
+    if args.loop:
+        print(f"--- DAEMON MODUS AKTIV: Check läuft alle {args.loop} Minuten ---")
+        while True:
+            await run_checker()
+            print(f"\nWarte {args.loop} Minuten bis zum nächsten Durchlauf...")
+            await asyncio.sleep(args.loop * 60)
+    else:
+        await run_checker()
 
 if __name__ == "__main__":
     asyncio.run(main())
